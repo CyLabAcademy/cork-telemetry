@@ -1,9 +1,13 @@
 # Standalone Telemetry Module
 
-This telemetry module is for use with cmgr multi host support. It runs a simple go server that returns a json with the format {"overloaded": True/False} depending on the status of the server.
+This telemetry module is for use with the cork orchestrator (forked from cmgr). It runs a simple go server that returns a json with the format {"overloaded": True/False} depending on the status of the server.
+
 To hit the endpoint do http://<ip_OR_URL>:2136/health
+
 By default it runs on port 2136 so make sure cmgr doesn't assign this port for a challenge! This setting is configurable
+
 It returns overloaded when cpu or ram >90%, it doesn't go back to fine until both drop below 80%
+
 The source code within the debug directory is for a custom debugger build that will expose more system health values and log them to stderr. By default telemetry only exposes whether or not the system is considered overloaded and does not log anything.
 
 ### Configuration
