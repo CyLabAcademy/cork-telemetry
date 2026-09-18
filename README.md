@@ -6,7 +6,31 @@ To hit the endpoint do http://<ip_OR_URL>:2136/health
 
 By default it runs on port 2136 so make sure cmgr doesn't assign this port for a challenge! This setting is configurable
 
-It returns overloaded when cpu or ram >90%, it doesn't go back to fine until both drop below 80%
+It returns overloaded when either cpu or ram crosses 90%, and does not go back
+to fine until that metric drops below 80%. The gap between the two marks is
+what stops a server sitting on the threshold from flapping on and off the
+scheduler.
+
+The two metrics are judged differently, because they behave differently:
+
+- **Memory trips at once**, in both directions. It is a level — it climbs as
+  containers start, does not come back down by itself, and a box over the mark
+  will still be over it a minute later. One sample is enough to act on, and
+  memory handed back is capacity returned.
+- **CPU has to be sustained**, eight consecutive samples (four seconds) past a
+  mark before the verdict moves either way, and deliberately reluctant. On a
+  challenge host a busy processor is very often the workload doing exactly
+  what it is for, and it says much less about whether the box can take another
+  container than memory does. Waiting costs little: cork polls every few
+  seconds anyway, and real saturation holds for minutes. Set
+  `TELEMETRY_CPU_SUSTAIN` to a different number of samples to tune it.
+
+Both figures are fractions of the **whole machine**, not of one core — the
+aggregate `cpu` line of `/proc/stat` already sums every processor. So 0.90 on a
+four-core server means roughly three and a half cores busy, and a single pinned
+core reads 0.25. That is the right question to ask of a box being offered more
+work: one saturated core says nothing about whether there is room for another
+container.
 
 The source code within the debug directory is for a custom debugger build that will expose more system health values and log them to stderr. By default telemetry only exposes whether or not the system is considered overloaded and does not log anything.
 
