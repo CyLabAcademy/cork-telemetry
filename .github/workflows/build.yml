@@ -26,7 +26,17 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Deliberately no CGO_ENABLED=0 here: the race detector needs cgo, and
+      # this step is about the code being right rather than about the artifact.
+      # The verdict is a rule the whole fleet's placement rests on, and it is
+      # pure, so there is no excuse for not exercising it on every push.
+      - name: Test
+        run: go test -race ./...
+
       # Static linux binaries: workers run these directly, no libc assumptions.
+      # Built here only to prove they still build -- the binaries that get
+      # deployed are the ones the release workflow builds from a tag, so there
+      # is nothing to keep from this run.
       - name: Build
         env:
           CGO_ENABLED: "0"
@@ -35,15 +45,3 @@ jobs:
         run: |
           go build -trimpath -o dist/telemetry .
           go build -trimpath -o dist/telemetry-debug ./debug
-
-      - name: Upload telemetry binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: telemetry
-          path: dist/telemetry
-
-      - name: Upload telemetry-debug binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: telemetry-debug
-          path: dist/telemetry-debug
