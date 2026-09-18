@@ -167,3 +167,59 @@ func TestBothMustRecover(t *testing.T) {
 		t.Fatal("the verdict did not clear once both metrics had recovered")
 	}
 }
+
+// ------------------------------------------------- is the verdict worth serving
+
+// An idle box settles on its first sample. The wait exists for boxes that come
+// up hot, and must cost nothing for the ordinary case.
+func TestAnIdleBoxSettlesImmediately(t *testing.T) {
+	var s State
+	s.Next(0.05, 0.20)
+	if !s.Settled() {
+		t.Fatal("an idle box was not settled after one sample: the wait is meant for a box that comes up hot, not for every start")
+	}
+}
+
+// The case the wait exists for. The run counters are process state, so an agent
+// restarted on a saturated box starts at cpuOver=false and would report "not
+// overloaded" for the whole Sustain window -- indistinguishable from a measured
+// verdict, and enough to green-light a worker that is in fact pegged.
+func TestASaturatedBoxIsUnsettledUntilItTrips(t *testing.T) {
+	s := State{Sustain: 4}
+	for i := 1; i < 4; i++ {
+		s.Next(0.99, 0.20)
+		if s.Settled() {
+			t.Fatalf("settled after %d saturated sample(s) with a sustain of 4: the agent would report this box healthy", i)
+		}
+	}
+	if !s.Next(0.99, 0.20) || !s.Settled() {
+		t.Fatal("the trip did not settle the verdict")
+	}
+}
+
+// And it settles the moment the box stops sustaining, without waiting out the
+// window: whatever it was doing, it is not tripping now.
+func TestAClimbThatBreaksSettlesAtOnce(t *testing.T) {
+	s := State{Sustain: 4}
+	s.Next(0.99, 0.20)
+	if s.Settled() {
+		t.Fatal("settled while still climbing")
+	}
+	s.Next(0.10, 0.20)
+	if !s.Settled() {
+		t.Fatal("a box that stopped sustaining did not settle")
+	}
+}
+
+// Memory never waits behind the CPU window. It is a level, one sample settles
+// it, and it is the axis that actually exhausts these boxes -- a box that comes
+// up over on memory must be reported at once even though CPU is still climbing.
+func TestMemorySettlesEvenWhileCPUIsStillClimbing(t *testing.T) {
+	s := State{Sustain: 8}
+	if !s.Next(0.99, 0.95) {
+		t.Fatal("memory over the mark did not report overloaded")
+	}
+	if !s.Settled() {
+		t.Fatal("a box out of memory waited behind the CPU window; that is the axis that must never wait")
+	}
+}

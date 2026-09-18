@@ -42,6 +42,16 @@ type snapshot struct {
 // and read by HTTP handlers, so an atomic pointer is sufficient.
 var state atomic.Pointer[snapshot]
 
+// haveVerdict reports whether that snapshot is worth anything. Identical to the
+// production binary's, and for the same reason: the listener binds before the
+// first sample exists, and an agent that can never read /proc would otherwise
+// serve a zero snapshot -- "not overloaded", 0% cpu, 0% mem -- indefinitely.
+var haveVerdict atomic.Bool
+
+// staleLimit is how many consecutive failed samples make the snapshot too old
+// to serve. Kept identical to the production binary.
+const staleLimit = 5
+
 func main() {
 	port := os.Getenv(portEnv)
 	if port == "" {
@@ -70,8 +80,26 @@ func main() {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if !haveVerdict.Load() {
+		http.Error(w, "no sample yet", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(state.Load())
+}
+
+// publish records one sample and returns the verdict. Split out for the same
+// reason as the production binary's: the line carrying Settled through to the
+// handler is otherwise inside a ticker no test can reach.
+func publish(ls *load.State, cpu, mem float64) bool {
+	overloaded := ls.Next(cpu, mem)
+	state.Store(&snapshot{
+		Overloaded: overloaded,
+		CPU:        cpu * 100,
+		Mem:        mem * 100,
+	})
+	haveVerdict.Store(ls.Settled())
+	return overloaded
 }
 
 // sampler periodically measures utilization, updates the verdict, and logs the
@@ -87,10 +115,19 @@ func sampler(sustain int) {
 	ticker := time.NewTicker(load.SampleInterval)
 	defer ticker.Stop()
 
+	misses := 0
+	fail := func(format string, err error) {
+		log.Printf(format, err)
+		misses++
+		if misses >= staleLimit {
+			haveVerdict.Store(false)
+		}
+	}
+
 	for range ticker.C {
 		cur, err := load.ReadCPU()
 		if err != nil {
-			log.Printf("reading /proc/stat: %v", err)
+			fail("reading /proc/stat: %v", err)
 			continue
 		}
 		cpu := load.Util(prev, cur)
@@ -98,16 +135,12 @@ func sampler(sustain int) {
 
 		mem, err := load.ReadMemUsed()
 		if err != nil {
-			log.Printf("reading /proc/meminfo: %v", err)
+			fail("reading /proc/meminfo: %v", err)
 			continue
 		}
 
-		overloaded := ls.Next(cpu, mem)
-		state.Store(&snapshot{
-			Overloaded: overloaded,
-			CPU:        cpu * 100,
-			Mem:        mem * 100,
-		})
+		overloaded := publish(&ls, cpu, mem)
+		misses = 0
 		log.Printf("cpu=%.1f%% mem=%.1f%% overloaded=%t", cpu*100, mem*100, overloaded)
 	}
 }

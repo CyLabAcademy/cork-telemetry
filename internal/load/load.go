@@ -140,6 +140,32 @@ func (s *State) Next(cpu, mem float64) bool {
 	return s.memOver || s.cpuOver
 }
 
+// Settled reports whether the verdict is worth serving yet.
+//
+// The run counters are process state, so a restarted agent cannot tell a box
+// that has been saturated for an hour from one that has been busy for half a
+// second. For the Sustain samples it takes to find out, Next returns false --
+// which is indistinguishable from a measured "this box is fine", and would
+// green-light a worker that is in fact pegged. An agent restart is not
+// hypothetical: an ansible apply restarts the unit on every worker at once.
+//
+// So the verdict is unsettled in exactly one situation: CPU is climbing toward
+// a trip and has not reached it. Every other state is known.
+//
+//   - Over on memory: settled at once. Memory is a level, one sample settles
+//     it, and it is the axis that actually exhausts these boxes -- it must not
+//     wait behind a CPU window.
+//   - Over on CPU: settled, the run completed.
+//   - Last sample not above the high mark: settled. Whatever the box was
+//     doing, it is not sustaining a trip right now.
+//
+// An idle box therefore settles on its first sample and the wait costs
+// nothing. Only a box that comes up hot waits, and that is the one case where
+// answering early would be answering wrongly.
+func (s *State) Settled() bool {
+	return s.memOver || s.cpuOver || s.runHigh == 0
+}
+
 // CPUTimes is one reading of the aggregate CPU counters.
 type CPUTimes struct{ Idle, Total uint64 }
 

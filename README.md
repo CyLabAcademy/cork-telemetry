@@ -6,6 +6,15 @@ To hit the endpoint do http://<ip_OR_URL>:2136/health
 
 By default it runs on port 2136 so make sure cmgr doesn't assign this port for a challenge! This setting is configurable
 
+Until it has a verdict worth giving it answers 503 rather than guessing, so a
+fresh agent is never mistaken for a healthy machine, and neither is a box the
+agent cannot yet judge. cork counts that as a missed poll. An idle box settles
+on its first sample; a box crossing the CPU high mark without holding it waits,
+because the agent will not call a box healthy while it cannot tell a sustained
+trip from a spike — so a worker hovering near the mark shows this now and
+again, for the life of the process, not only at startup. Memory never waits —
+one sample settles it.
+
 It returns overloaded when either cpu or ram crosses 90%, and does not go back
 to fine until that metric drops below 80%. The gap between the two marks is
 what stops a server sitting on the threshold from flapping on and off the
