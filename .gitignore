@@ -1,0 +1,3 @@
+# compiled binaries, including the debug build's own output
+/telemetry
+/debug/debug

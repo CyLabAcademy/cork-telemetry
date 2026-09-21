@@ -1,10 +1,9 @@
 // Command telemetry is a minimal worker health agent.
 //
 // It samples host CPU and memory utilization from /proc on a fixed ticker and
-// exposes the result at GET /health as {"overloaded": true|false}. The verdict
-// uses hysteresis: it trips to overloaded once either metric exceeds 90%, and
-// only clears once BOTH metrics fall back below 80%. This keeps a worker that
-// hovers around the threshold from flapping on and off the scheduler.
+// exposes the result at GET /health as {"overloaded": true|false}. The rule
+// lives in internal/load, which the debug build shares, and its doc comment
+// explains why memory and CPU are judged differently.
 //
 // It reads only world-readable files under /proc, so it requires no privileges
 // and should be run as an unprivileged user. All diagnostics go to stderr;
@@ -13,32 +12,48 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/CyLabAcademy/cork-telemetry/internal/load"
 )
 
 const (
 	defaultPort = "2136"
 	portEnv     = "TELEMETRY_PORT"
-
-	// Hysteresis band: trip at the high mark, only recover below the low mark.
-	highThreshold = 0.90
-	lowThreshold  = 0.80
-
-	sampleInterval = 500 * time.Millisecond
 )
 
 // overloaded holds the latest verdict. It is written only by the sampler
 // goroutine and read by HTTP handlers, so an atomic is sufficient.
 var overloaded atomic.Bool
+
+// haveVerdict reports whether the verdict above is worth anything: false until
+// a sample has both succeeded AND settled (load.State.Settled), and false
+// again once the sampler has failed to take one for staleLimit ticks running.
+//
+// Without it the agent fails open on the axis that matters. The listener binds
+// before the sampler has produced anything, and an atomic.Bool reads false, so
+// a fresh agent answers "not overloaded" for the gap -- and, worse, an agent
+// that can never read /proc/meminfo (a systemd hardening option that hides it,
+// say) takes the `continue` below on every tick forever and goes on answering
+// "not overloaded" for its whole life with nothing behind it. cork would
+// record a healthy load for a box it has never actually measured.
+//
+// Counted in failed samples rather than elapsed time on purpose: a sampler
+// starved of CPU is not running to count, so a genuinely loaded box cannot
+// declare itself unmeasured just for being busy -- which is precisely when its
+// reading matters most.
+var haveVerdict atomic.Bool
+
+// staleLimit is how many consecutive failed samples make the last verdict too
+// old to serve. Five is 2.5 seconds at the sample interval, comfortably more
+// than a blip and comfortably less than cork's tolerance for missed polls.
+const staleLimit = 5
 
 func main() {
 	port := os.Getenv(portEnv)
@@ -49,7 +64,14 @@ func main() {
 		log.Fatalf("invalid %s=%q: must be a port number", portEnv, port)
 	}
 
-	go sampler()
+	sustain, err := load.SustainFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("cpu must hold past a mark for %d samples (%s) before the verdict moves; memory moves at once",
+		sustain, time.Duration(sustain)*load.SampleInterval)
+
+	go sampler(sustain)
 
 	http.HandleFunc("/health", healthHandler)
 
@@ -58,7 +80,19 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
+// healthHandler answers the verdict, or refuses to answer at all.
+//
+// 503 rather than a cheerful default: cork counts a non-200 as a missed poll,
+// which moves the worker's load axis to unknown. Unknown still takes
+// placements -- a box whose agent is quiet is usually still serving -- but it
+// is visible in worker-list, and it is what tells an autoscaler that a newly
+// built box has not finished coming up. A false "not overloaded" would be
+// indistinguishable from a healthy machine.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if !haveVerdict.Load() {
+		http.Error(w, "no sample yet", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"overloaded": overloaded.Load()})
 }
@@ -66,133 +100,60 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // sampler periodically measures utilization and updates the overloaded verdict.
 // CPU utilization is a delta between consecutive /proc/stat reads, so it keeps
 // the previous sample across ticks.
-func sampler() {
-	prev, err := readCPU()
+func sampler(sustain int) {
+	prev, err := load.ReadCPU()
 	if err != nil {
 		log.Fatalf("reading /proc/stat: %v", err)
 	}
 
-	ticker := time.NewTicker(sampleInterval)
+	state := load.State{Sustain: sustain}
+
+	ticker := time.NewTicker(load.SampleInterval)
 	defer ticker.Stop()
 
+	misses := 0
+	fail := func(format string, err error) {
+		log.Printf(format, err)
+		misses++
+		if misses == staleLimit {
+			// Once, on the way out: a box whose /proc has become unreadable
+			// would otherwise log this every tick forever.
+			log.Printf("no sample in %d ticks; reporting unavailable until one succeeds", misses)
+		}
+		if misses >= staleLimit {
+			haveVerdict.Store(false)
+		}
+	}
+
 	for range ticker.C {
-		cur, err := readCPU()
+		cur, err := load.ReadCPU()
 		if err != nil {
-			log.Printf("reading /proc/stat: %v", err)
+			fail("reading /proc/stat: %v", err)
 			continue
 		}
-		cpu := cpuUtil(prev, cur)
+		cpu := load.Util(prev, cur)
 		prev = cur
 
-		mem, err := readMemUsed()
+		mem, err := load.ReadMemUsed()
 		if err != nil {
-			log.Printf("reading /proc/meminfo: %v", err)
+			fail("reading /proc/meminfo: %v", err)
 			continue
 		}
 
-		overloaded.Store(evaluate(overloaded.Load(), cpu, mem))
+		publish(&state, cpu, mem)
+		misses = 0
 	}
 }
 
-// evaluate applies the hysteresis rule. Once overloaded, both metrics must fall
-// below the low threshold before recovering; otherwise either metric crossing
-// the high threshold trips it.
-func evaluate(currentlyOverloaded bool, cpu, mem float64) bool {
-	if currentlyOverloaded {
-		return !(cpu < lowThreshold && mem < lowThreshold)
-	}
-	return cpu > highThreshold || mem > highThreshold
-}
-
-type cpuTimes struct{ idle, total uint64 }
-
-// readCPU parses the aggregate "cpu" line of /proc/stat. idle counts both the
-// idle and iowait fields.
-func readCPU() (cpuTimes, error) {
-	data, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return cpuTimes{}, err
-	}
-	line := strings.SplitN(string(data), "\n", 2)[0]
-	fields := strings.Fields(line)
-	if len(fields) < 5 || fields[0] != "cpu" {
-		return cpuTimes{}, fmt.Errorf("unexpected /proc/stat format: %q", line)
-	}
-
-	var t cpuTimes
-	for i, f := range fields[1:] {
-		v, err := strconv.ParseUint(f, 10, 64)
-		if err != nil {
-			return cpuTimes{}, err
-		}
-		t.total += v
-		if i == 3 || i == 4 { // idle, iowait
-			t.idle += v
-		}
-	}
-	return t, nil
-}
-
-// cpuUtil returns the busy fraction between two samples.
-func cpuUtil(prev, cur cpuTimes) float64 {
-	dTotal := cur.total - prev.total
-	if dTotal == 0 {
-		return 0
-	}
-	dIdle := cur.idle - prev.idle
-	return float64(dTotal-dIdle) / float64(dTotal)
-}
-
-// readMemUsed returns used memory as a fraction of total, using MemAvailable as
-// the kernel's estimate of what can be allocated without swapping.
-func readMemUsed() (float64, error) {
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	var total, avail uint64
-	var haveTotal, haveAvail bool
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		key, val, ok := parseMeminfoLine(sc.Text())
-		if !ok {
-			continue
-		}
-		switch key {
-		case "MemTotal":
-			total, haveTotal = val, true
-		case "MemAvailable":
-			avail, haveAvail = val, true
-		}
-		if haveTotal && haveAvail {
-			break
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return 0, err
-	}
-	if !haveTotal || total == 0 {
-		return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
-	}
-	if !haveAvail {
-		return 0, fmt.Errorf("MemAvailable not found in /proc/meminfo")
-	}
-	return float64(total-avail) / float64(total), nil
-}
-
-// parseMeminfoLine splits a line like "MemTotal:  16384000 kB" into its key and
-// numeric value (in kB).
-func parseMeminfoLine(line string) (key string, val uint64, ok bool) {
-	fields := strings.Fields(line)
-	if len(fields) < 2 {
-		return "", 0, false
-	}
-	key = strings.TrimSuffix(fields[0], ":")
-	v, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return "", 0, false
-	}
-	return key, v, true
+// publish records one sample: the verdict, and whether the verdict is worth
+// serving.
+//
+// Split out of the loop above so that pairing is reachable from a test. The
+// sampler is a ticker wrapped around /proc reads and nothing can get inside it,
+// so with this inline the line that carries Settled through to the handler was
+// the one line in the file no test could see -- and storing a bare true there
+// instead, which is what this used to do, passed the whole suite.
+func publish(state *load.State, cpu, mem float64) {
+	overloaded.Store(state.Next(cpu, mem))
+	haveVerdict.Store(state.Settled())
 }

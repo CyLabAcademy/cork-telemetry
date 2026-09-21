@@ -35,6 +35,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Before anything is built, tagged, checksummed and published. A release
+      # is the one run where a failing test must stop the job rather than
+      # annotate it. No CGO_ENABLED=0: the race detector needs cgo.
+      - name: Test
+        run: go test -race ./...
+
       # Static linux binaries: workers run these directly, no libc assumptions.
       - name: Build
         env:
